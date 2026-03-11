@@ -134,8 +134,10 @@ const App = {
   // === Routing ===
 
   route() {
+    this.saveDraft();
     this.stopPolling();
     this.currentView = null;
+    this._currentSessionName = null;
 
     const hash = location.hash || '#/';
 
@@ -337,6 +339,7 @@ const App = {
 
   async showSession(bufferName) {
     this.currentView = 'session';
+    this._currentSessionName = bufferName;
     this.userScrolledUp = false;
 
     const content = document.getElementById('app-content');
@@ -415,12 +418,16 @@ const App = {
       </div>
     `;
 
-    // Auto-resize textarea
+    // Auto-resize textarea and save draft on input
     const textarea = document.getElementById('chat-input');
     textarea.addEventListener('input', () => {
       textarea.style.height = 'auto';
       textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+      this.saveDraft();
     });
+
+    // Restore any saved draft
+    this.restoreDraft(bufferName);
 
     // Enter to send (Shift+Enter for newline)
     textarea.addEventListener('keydown', (e) => {
@@ -511,6 +518,7 @@ const App = {
     input.style.height = 'auto';
     input.disabled = true;
     document.getElementById('chat-send').disabled = true;
+    this.clearDraft(bufferName);
 
     try {
       await API.sendMessage(bufferName, text);
@@ -571,6 +579,38 @@ const App = {
       content.style.overflow = '';
       content.style.padding = '';
     }
+  },
+
+  // === Draft Persistence ===
+
+  _draftKey(bufferName) {
+    return 'draft:' + bufferName;
+  },
+
+  saveDraft() {
+    const input = document.getElementById('chat-input');
+    if (!input || !this._currentSessionName) return;
+    const text = input.value;
+    if (text) {
+      sessionStorage.setItem(this._draftKey(this._currentSessionName), text);
+    } else {
+      sessionStorage.removeItem(this._draftKey(this._currentSessionName));
+    }
+  },
+
+  restoreDraft(bufferName) {
+    const input = document.getElementById('chat-input');
+    if (!input) return;
+    const draft = sessionStorage.getItem(this._draftKey(bufferName));
+    if (draft) {
+      input.value = draft;
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+    }
+  },
+
+  clearDraft(bufferName) {
+    sessionStorage.removeItem(this._draftKey(bufferName));
   },
 
   // === Breadcrumb ===
