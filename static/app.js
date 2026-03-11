@@ -220,7 +220,6 @@ const App = {
     // Close any existing menus
     document.querySelectorAll('.config-menu').forEach(m => m.remove());
 
-    const dropdown = button.closest('.config-dropdown');
     const menu = document.createElement('div');
     menu.className = 'config-menu';
 
@@ -240,7 +239,19 @@ const App = {
       }
     }
 
-    dropdown.appendChild(menu);
+    // Append to body with fixed positioning to avoid overflow clipping
+    document.body.appendChild(menu);
+    const rect = button.getBoundingClientRect();
+    const menuWidth = menu.offsetWidth;
+    let left = rect.left;
+    // If menu would overflow the right edge, align to button's right edge instead
+    if (left + menuWidth > window.innerWidth) {
+      left = rect.right - menuWidth;
+    }
+    // Clamp to viewport
+    left = Math.max(4, Math.min(left, window.innerWidth - menuWidth - 4));
+    menu.style.top = rect.bottom + 4 + 'px';
+    menu.style.left = left + 'px';
 
     // Close on outside click
     const close = (e) => {
