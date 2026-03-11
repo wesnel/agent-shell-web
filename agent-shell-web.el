@@ -56,36 +56,128 @@
 (defvar agent-shell-web--max-body-size (* 1 1024 1024)
   "Maximum HTTP request body size in bytes (1MB).")
 
-;;; --- Permission Capture ---
+(defvar agent-shell-web--debug nil
+  "When non-nil, log debug messages to *Messages*.")
 
-(defvar agent-shell-web--permission-options (make-hash-table :test 'equal)
-  "Maps (buffer-name . tool-call-id) -> ACP permission options list.")
+;;; --- Permission Capture ---
 
 (defun agent-shell-web--capture-permission-request (orig-fn &rest args)
   "Advice to capture ACP permission request options.
-Wraps ORIG-FN with ARGS, intercepting session/request_permission."
+Wraps ORIG-FN with ARGS, intercepting session/request_permission.
+After ORIG-FN saves the tool call, annotates it with the ACP options
+so they can be read back when building the web UI."
+  ;; Call original first so the tool-call is saved in state
+  (apply orig-fn args)
+  ;; Now annotate the tool-call with the ACP options
   (let* ((state (plist-get args :state))
          (acp-request (plist-get args :acp-request)))
     (when (and acp-request
                (equal (map-elt acp-request 'method) "session/request_permission"))
-      (let ((buf-name (buffer-name (map-elt state :buffer)))
-            (tool-call-id (map-nested-elt acp-request '(params toolCall toolCallId)))
-            (options (map-nested-elt acp-request '(params options))))
-        (when (and buf-name tool-call-id options)
-          (puthash (cons buf-name tool-call-id) options
-                   agent-shell-web--permission-options)))))
-  (apply orig-fn args))
+      (let* ((tool-call-id (map-nested-elt acp-request '(params toolCall toolCallId)))
+             (options (map-nested-elt acp-request '(params options)))
+             (tool-call (when tool-call-id
+                          (map-elt (map-elt state :tool-calls) tool-call-id))))
+        (when agent-shell-web--debug
+          (message "agent-shell-web: permission capture — tool-call-id=%s options=%S tool-call=%S"
+                   tool-call-id options (when tool-call (mapcar #'car tool-call))))
+        (when (and tool-call options)
+          ;; Append options to the tool-call alist in place
+          (nconc tool-call (list (cons :permission-options options))))))))
 
-(defun agent-shell-web--cleanup-permission-response (orig-fn &rest args)
-  "Advice to clean up stored permission options after response.
-Wraps ORIG-FN with ARGS."
-  (let ((tool-call-id (plist-get args :tool-call-id))
-        (state (plist-get args :state)))
-    (prog1 (apply orig-fn args)
-      (when (and state tool-call-id)
-        (let ((buf-name (buffer-name (map-elt state :buffer))))
-          (remhash (cons buf-name tool-call-id)
-                   agent-shell-web--permission-options))))))
+;;; --- Fragment Extraction ---
+
+(defun agent-shell-web--classify-fragment (qualified-id)
+  "Classify QUALIFIED-ID into a fragment type string."
+  (cond
+   ((string-match-p "agent_thought_chunk" qualified-id) "thought")
+   ((string-match-p "user_message_chunk" qualified-id) "user_message")
+   ((string-match-p "agent_message_chunk" qualified-id) "agent_message")
+   ((string-match-p "^[0-9]+-plan$" qualified-id) "plan")
+   ((string-match-p "-plan$" qualified-id) "tool_plan")
+   ((string-match-p "permission" qualified-id) "permission")
+   ((string-match-p "available_commands" qualified-id) "commands")
+   ((string-match-p "Error" qualified-id) "error")
+   (t "tool_call")))
+
+(defun agent-shell-web--extract-fragments ()
+  "Extract structured fragment data from current agent-shell buffer.
+Returns a list of alists, each representing a fragment with its type,
+labels, body, and collapse state."
+  (save-excursion
+    (let ((fragments '())
+          (pos (point-min)))
+      (while (< pos (point-max))
+        (let ((state (get-text-property pos 'agent-shell-ui-state)))
+          (if (not state)
+              ;; No fragment property here — capture as plain text
+              (let* ((next (or (next-single-property-change
+                                pos 'agent-shell-ui-state nil (point-max))
+                               (point-max)))
+                     (text (string-trim
+                            (buffer-substring-no-properties pos next))))
+                (when (> (length text) 0)
+                  (push `((id . "")
+                          (type . "text")
+                          (label . "")
+                          (status . "")
+                          (body . ,text)
+                          (collapsed . :json-false)
+                          (collapsible . :json-false))
+                        fragments))
+                (setq pos next))
+            ;; Found a fragment — determine its extent
+            (let* ((qid (cdr (assq :qualified-id state)))
+                   (collapsed (cdr (assq :collapsed state)))
+                   ;; End of this fragment's agent-shell-ui-state span
+                   (frag-end (or (next-single-property-change
+                                  pos 'agent-shell-ui-state nil (point-max))
+                                 (point-max)))
+                   ;; Walk sub-sections within the fragment
+                   (label-left nil)
+                   (label-right nil)
+                   (body nil)
+                   (has-sections nil)
+                   (sub-pos pos))
+              (while (< sub-pos frag-end)
+                (let* ((section (get-text-property
+                                 sub-pos 'agent-shell-ui-section))
+                       (sub-next (min frag-end
+                                      (or (next-single-property-change
+                                           sub-pos 'agent-shell-ui-section
+                                           nil frag-end)
+                                          frag-end)))
+                       (text (buffer-substring-no-properties sub-pos sub-next)))
+                  (pcase section
+                    ('indicator (setq has-sections t))
+                    ('label-left
+                     (setq has-sections t)
+                     (setq label-left (string-trim text)))
+                    ('label-right
+                     (setq has-sections t)
+                     (setq label-right (string-trim text)))
+                    ('body
+                     (setq has-sections t)
+                     (setq body (string-trim text))))
+                  (setq sub-pos sub-next)))
+              ;; If no sub-sections found, treat whole span as text
+              (unless has-sections
+                (setq body (string-trim
+                            (buffer-substring-no-properties pos frag-end))))
+              (let* ((frag-type (agent-shell-web--classify-fragment
+                                 (or qid "")))
+                     (collapsible (member frag-type
+                                          '("tool_call" "thought" "plan"
+                                            "tool_plan" "commands" "error"))))
+                (push `((id . ,(or qid ""))
+                        (type . ,frag-type)
+                        (label . ,(or label-right ""))
+                        (status . ,(or label-left ""))
+                        (body . ,(or body ""))
+                        (collapsed . ,(if collapsed t :json-false))
+                        (collapsible . ,(if collapsible t :json-false)))
+                      fragments))
+              (setq pos frag-end)))))
+      (vconcat (nreverse fragments)))))
 
 ;;; --- MIME Types ---
 
@@ -242,6 +334,37 @@ Returns (:method METHOD :path PATH :query-params PARAMS :headers HEADERS :body B
          ((and (equal method "GET") (equal path "/api/status"))
           (agent-shell-web--api-status process request))
 
+         ;; API: debug (temporary)
+         ((and (equal method "GET") (equal path "/api/debug"))
+          (let ((tc-debug
+                 (mapcar
+                  (lambda (buf)
+                    (with-current-buffer buf
+                      (let* ((state agent-shell--state)
+                             (tc-map (map-elt state :tool-calls)))
+                        `((buffer . ,(buffer-name buf))
+                          (tool_calls
+                           . ,(when tc-map
+                                (let (entries)
+                                  (map-do
+                                   (lambda (id tc)
+                                     (push `((id . ,id)
+                                             (keys . ,(mapcar #'car tc))
+                                             (has_permission_options
+                                              . ,(if (map-elt tc :permission-options) t :json-false)))
+                                           entries))
+                                   tc-map)
+                                  (vconcat entries))))))))
+                  (when (fboundp 'agent-shell-buffers) (agent-shell-buffers)))))
+            (agent-shell-web--respond-json process 200
+             `((advice_installed . ,(if (advice-member-p
+                                         #'agent-shell-web--capture-permission-request
+                                         #'agent-shell--on-request) t :json-false))
+               (on_request_fboundp . ,(if (fboundp 'agent-shell--on-request) t :json-false))
+               (agent_shell_feature . ,(if (featurep 'agent-shell) t :json-false))
+               (emacs_pid . ,(emacs-pid))
+               (sessions . ,(vconcat tc-debug))))))
+
          ;; API: sessions list
          ((and (equal method "GET") (equal path "/api/sessions"))
           (agent-shell-web--api-sessions process request))
@@ -319,9 +442,11 @@ Returns (:method METHOD :path PATH :query-params PARAMS :headers HEADERS :body B
   (let* ((roots (when (fboundp 'project-known-project-roots)
                   (project-known-project-roots)))
          (projects (mapcar (lambda (root)
-                             `((root . ,root)
-                               (name . ,(file-name-nondirectory
-                                         (directory-file-name root)))))
+                             (let ((expanded (file-name-as-directory
+                                             (expand-file-name root))))
+                               `((root . ,expanded)
+                                 (name . ,(file-name-nondirectory
+                                           (directory-file-name expanded))))))
                            roots)))
     (agent-shell-web--respond-json process 200
                                    `((projects . ,(vconcat projects))))))
@@ -373,16 +498,18 @@ Returns (:method METHOD :path PATH :query-params PARAMS :headers HEADERS :body B
                     (with-current-buffer buf
                       (let* ((state agent-shell--state)
                              (pending (agent-shell-web--pending-permission-count state)))
-                        `((buffer_name . ,(buffer-name buf))
-                          (project_root . ,(condition-case nil (agent-shell-cwd) (error "")))
-                          (project_name . ,(file-name-nondirectory
-                                            (directory-file-name
-                                             (condition-case nil (agent-shell-cwd) (error default-directory)))))
-                          (agent_name . ,(or (map-nested-elt state '(:agent-config :buffer-name)) ""))
-                          (busy . ,(if (agent-shell-web--shell-busy-p) t :json-false))
-                          (stuck . ,(if (> pending 0) t :json-false))
-                          (pending_permission_count . ,pending)
-                          (session_id . ,(or (map-nested-elt state '(:session :id)) :json-null))))))
+                        (let ((cwd (condition-case nil
+                                       (file-name-as-directory (agent-shell-cwd))
+                                     (error ""))))
+                          `((buffer_name . ,(buffer-name buf))
+                            (project_root . ,cwd)
+                            (project_name . ,(file-name-nondirectory
+                                              (directory-file-name (if (string-empty-p cwd) default-directory cwd))))
+                            (agent_name . ,(or (map-nested-elt state '(:agent-config :buffer-name)) ""))
+                            (busy . ,(if (agent-shell-web--shell-busy-p) t :json-false))
+                            (stuck . ,(if (> pending 0) t :json-false))
+                            (pending_permission_count . ,pending)
+                            (session_id . ,(or (map-nested-elt state '(:session :id)) :json-null)))))))
                   filtered)))
     (agent-shell-web--respond-json process 200
                                    `((sessions . ,(vconcat sessions))))))
@@ -419,11 +546,13 @@ Returns (:method METHOD :path PATH :query-params PARAMS :headers HEADERS :body B
     (with-current-buffer buf
       (let* ((state agent-shell--state)
              (content (buffer-substring-no-properties (point-min) (point-max)))
+             (fragments (agent-shell-web--extract-fragments))
              (pending (agent-shell-web--pending-permissions state))
              (usage (map-elt state :usage)))
         (agent-shell-web--respond-json process 200
                                        `((buffer_name . ,buf-name)
                                          (content . ,content)
+                                         (fragments . ,fragments)
                                          (busy . ,(if (agent-shell-web--shell-busy-p) t :json-false))
                                          (stuck . ,(if (> (length pending) 0) t :json-false))
                                          (session_id . ,(or (map-nested-elt state '(:session :id)) :json-null))
@@ -486,11 +615,12 @@ Returns (:method METHOD :path PATH :query-params PARAMS :headers HEADERS :body B
                (tool-call (map-elt (map-elt state :tool-calls) tool-call-id))
                (request-id (when tool-call (map-elt tool-call :permission-request-id)))
                (client (map-elt state :client))
-               ;; Look up option kind BEFORE sending response (cleanup advice removes the entry)
-               (options (gethash (cons buf-name tool-call-id)
-                                 agent-shell-web--permission-options))
+               (options (map-elt tool-call :permission-options))
+               ;; Determine if this is a rejection by looking up the option's kind
                (selected-option (when (and options option-id)
-                                  (seq-find (lambda (opt) (equal (map-elt opt 'optionId) option-id)) options)))
+                                  (seq-find (lambda (opt)
+                                              (equal (map-elt opt 'optionId) option-id))
+                                            options)))
                (is-reject (when selected-option
                             (equal (map-elt selected-option 'kind) "reject_once"))))
           (unless request-id
@@ -505,7 +635,10 @@ Returns (:method METHOD :path PATH :query-params PARAMS :headers HEADERS :body B
            :tool-call-id tool-call-id
            :message-text (if (eq cancelled t)
                              "Permission cancelled via web UI"
-                           (format "Permission granted via web UI: %s" option-id)))
+                           (format "Permission responded via web UI: %s"
+                                   (or (when selected-option
+                                         (map-elt selected-option 'name))
+                                       option-id))))
           ;; If rejected, interrupt the agent
           (when is-reject
             (agent-shell-interrupt t))
@@ -537,9 +670,7 @@ Must be called from within a shell buffer."
       (map-do
        (lambda (tool-call-id tool-call-data)
          (when-let ((request-id (map-elt tool-call-data :permission-request-id)))
-           (let* ((buf-name (buffer-name (map-elt state :buffer)))
-                  (options (gethash (cons buf-name tool-call-id)
-                                   agent-shell-web--permission-options)))
+           (let ((options (map-elt tool-call-data :permission-options)))
              (push `((tool_call_id . ,tool-call-id)
                      (request_id . ,request-id)
                      (title . ,(or (map-elt tool-call-data :title) "Tool Permission"))
@@ -563,6 +694,11 @@ Must be called from within a shell buffer."
     `((total_tokens . ,(or (map-elt usage :total-tokens) 0))
       (input_tokens . ,(or (map-elt usage :input-tokens) 0))
       (output_tokens . ,(or (map-elt usage :output-tokens) 0))
+      (thought_tokens . ,(or (map-elt usage :thought-tokens) 0))
+      (cached_read_tokens . ,(or (map-elt usage :cached-read-tokens) 0))
+      (cached_write_tokens . ,(or (map-elt usage :cached-write-tokens) 0))
+      (context_used . ,(or (map-elt usage :context-used) 0))
+      (context_size . ,(or (map-elt usage :context-size) 0))
       (cost_amount . ,(or (map-elt usage :cost-amount) 0))
       (cost_currency . ,(or (map-elt usage :cost-currency) :json-null)))))
 
@@ -575,9 +711,7 @@ Must be called from within a shell buffer."
   (setq agent-shell-web--port (or port 8888))
   (when agent-shell-web--server-process
     (agent-shell-web-stop))
-  ;; Install advice
-  (advice-add 'agent-shell--on-request :around #'agent-shell-web--capture-permission-request)
-  (advice-add 'agent-shell--send-permission-response :around #'agent-shell-web--cleanup-permission-response)
+  ;; Advice is installed at load time (see bottom of file)
   (setq agent-shell-web--server-process
         (make-network-process
          :name "agent-shell-web"
@@ -595,16 +729,23 @@ Must be called from within a shell buffer."
 (defun agent-shell-web-stop ()
   "Stop the agent-shell-web HTTP server."
   (interactive)
-  ;; Remove advice
-  (advice-remove 'agent-shell--on-request #'agent-shell-web--capture-permission-request)
-  (advice-remove 'agent-shell--send-permission-response #'agent-shell-web--cleanup-permission-response)
-  ;; Clear state
-  (clrhash agent-shell-web--permission-options)
   ;; Stop server
   (when agent-shell-web--server-process
     (delete-process agent-shell-web--server-process)
     (setq agent-shell-web--server-process nil))
   (message "agent-shell-web server stopped"))
+
+;;; --- Advice Installation ---
+;; Install advice at load time so it's active in the Emacs instance
+;; that loads this file.  Use eval-after-load to handle the case where
+;; agent-shell is loaded lazily after this file.
+(with-eval-after-load 'agent-shell
+  (advice-add 'agent-shell--on-request :around
+              #'agent-shell-web--capture-permission-request))
+;; Also try immediately in case agent-shell is already loaded
+(when (fboundp 'agent-shell--on-request)
+  (advice-add 'agent-shell--on-request :around
+              #'agent-shell-web--capture-permission-request))
 
 (provide 'agent-shell-web)
 
