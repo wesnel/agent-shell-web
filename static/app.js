@@ -410,6 +410,7 @@ const App = {
     document.body.appendChild(menu);
     const rect = button.getBoundingClientRect();
     const menuWidth = menu.offsetWidth;
+    const menuHeight = menu.offsetHeight;
     let left = rect.left;
     // If menu would overflow the right edge, align to button's right edge instead
     if (left + menuWidth > window.innerWidth) {
@@ -417,7 +418,19 @@ const App = {
     }
     // Clamp to viewport
     left = Math.max(4, Math.min(left, window.innerWidth - menuWidth - 4));
-    menu.style.top = rect.bottom + 4 + 'px';
+
+    const spaceBelow = window.innerHeight - rect.bottom - 8;
+    const spaceAbove = rect.top - 8;
+    if (menuHeight > spaceBelow && spaceAbove > spaceBelow) {
+      // Show above the button
+      const maxH = Math.min(menuHeight, spaceAbove);
+      menu.style.maxHeight = maxH + 'px';
+      menu.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+    } else {
+      // Show below the button (default)
+      menu.style.maxHeight = spaceBelow + 'px';
+      menu.style.top = rect.bottom + 4 + 'px';
+    }
     menu.style.left = left + 'px';
 
     // Close on outside click
