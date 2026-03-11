@@ -12,6 +12,12 @@ A web-based UI for [agent-shell](https://github.com/xenodium/agent-shell) sessio
 - **Installable PWA** — add to your phone's home screen for an app-like experience with background notifications when a session needs attention
 - **Mobile-first design** — dark terminal-aesthetic theme, large touch targets, safe-area support for notched devices
 
+## Screenshots
+
+| Projects | Session List | Chat View | Permission Dialog |
+|----------|-------------|-----------|-------------------|
+| ![Projects](screenshots/projects.png) | ![Sessions](screenshots/sessions.png) | ![Chat](screenshots/chat.png) | ![Permission](screenshots/permission.png) |
+
 ## Architecture
 
 The entire backend is a single Emacs Lisp file (`agent-shell-web.el`) that implements an HTTP server using Emacs's built-in `make-network-process`. It serves both a REST API and the static frontend files. No external dependencies beyond `agent-shell` itself are required — no Node.js, no npm, no bundler.
