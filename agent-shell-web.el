@@ -365,7 +365,7 @@ Returns (:method METHOD :path PATH :query-params PARAMS :headers HEADERS :body B
                        (seq-filter
                         (lambda (buf)
                           (with-current-buffer buf
-                            (equal project-filter (agent-shell-cwd))))
+                            (file-equal-p project-filter (agent-shell-cwd))))
                         buffers)
                      buffers))
          (sessions
